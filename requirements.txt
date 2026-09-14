@@ -1,7 +1,7 @@
 streamlit
-keras>=3.3.0
-torch --index-url https://download.pytorch.org/whl/cpu
+tensorflow-cpu==2.15.0
+h5py
 pillow
 matplotlib
-numpy
+numpy<2.0.0
 huggingface_hub
