@@ -1,8 +1,7 @@
 streamlit
-keras>=3.4.0
-torch
-torchvision
+tensorflow-cpu==2.15.0
 pillow
 matplotlib
-numpy
+numpy<2.0.0
 huggingface_hub
+h5py
