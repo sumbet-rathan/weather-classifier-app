@@ -1,6 +1,5 @@
 import os
-# Force Keras 3 to use the TensorFlow backend
-os.environ["KERAS_BACKEND"] = "tensorflow"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 import json
 from PIL import Image
@@ -8,7 +7,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 import tensorflow as tf
-import keras
 from huggingface_hub import hf_hub_download
 
 st.set_page_config(page_title="Weather Classifier", layout="centered")
@@ -21,8 +19,7 @@ def load_all():
         filename="best_weather_model.keras",
         repo_type="space"
     )
-    # Use native Keras 3 to deserialize the .keras archive
-    model = keras.models.load_model(model_path, compile=False)
+    model = tf.keras.models.load_model(model_path, compile=False)
     
     with open("weather_classes.json", "r") as f:
         labels = json.load(f)
@@ -36,17 +33,14 @@ if uploaded_file:
     image_raw = Image.open(uploaded_file).convert("RGB")
     st.image(image_raw, caption="Uploaded Image", use_container_width=True)
 
-    # Preprocess
     resized = image_raw.resize((224, 224))
     img_array = np.expand_dims(np.array(resized) / 255.0, axis=0)
 
-    # Inference
     preds = model(img_array, training=False).numpy()[0]
     top_idx = np.argmax(preds)
 
     st.subheader(f"Prediction: **{idx_to_class[top_idx]}** ({preds[top_idx]*100:.1f}%)")
 
-    # Grad-CAM
     try:
         backbone = model.layers[0]
         grad_model = tf.keras.models.Model(
