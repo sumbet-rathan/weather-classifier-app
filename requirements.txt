@@ -1,6 +1,8 @@
-streamlit
-tensorflow>=2.15.0
-pillow
-matplotlib
-numpy
+Streamlit>=1.30.0
+tensorflow-cpu==2.15.0
+pillow>=9.5.0
+matplotlib>=3.7.0
+numpy<2.0.0
 huggingface_hub
+
+
