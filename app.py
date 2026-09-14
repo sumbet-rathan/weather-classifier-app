@@ -4,13 +4,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 import tensorflow as tf
+from huggingface_hub import hf_hub_download
 
 st.set_page_config(page_title="Weather Classifier", layout="centered")
 st.title("🌦️ Weather Classifier (DenseNet121 + Grad-CAM)")
 
 @st.cache_resource
 def load_all():
-    model = tf.keras.models.load_model("best_weather_model.keras")
+    # Automatically download the 38MB model file from your HF repo
+    model_path = hf_hub_download(
+        repo_id="RATHANSUMBET14/weather-vision-app",
+        filename="best_weather_model.keras",
+        repo_type="space"
+    )
+    model = tf.keras.models.load_model(model_path)
+    
     with open("weather_classes.json", "r") as f:
         labels = json.load(f)
     return model, {int(k): v for k, v in labels.items()}
