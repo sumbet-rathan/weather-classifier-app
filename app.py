@@ -17,38 +17,38 @@ from huggingface_hub import hf_hub_download
 st.set_page_config(page_title="Weather Classifier", layout="centered")
 st.title("🌦️ Weather Classifier (DenseNet121 + Grad-CAM)")
 
-def load_weights_by_shape(model, h5_file_path):
-    """Walks the h5 weights file and sets weights matching layer shapes."""
-    with h5py.File(h5_file_path, "r") as f:
-        weight_tensors = []
-        def visitor(name, obj):
-            if isinstance(obj, h5py.Dataset):
-                weight_tensors.append(np.array(obj))
-        f.visititems(visitor)
+def load_exact_weights(model, h5_path):
+    """Loads weights by matching exact layer names from Keras 3 h5 format."""
+    with h5py.File(h5_path, "r") as h5:
+        # Check top-level group structure
+        root = h5["layers"] if "layers" in h5 else h5
 
-    # Assign weights sequentially to layers that expect them
-    idx = 0
-    for layer in model.layers:
-        weights = layer.get_weights()
-        if not weights:
-            continue
-        new_weights = []
-        for w in weights:
-            if idx < len(weight_tensors) and weight_tensors[idx].shape == w.shape:
-                new_weights.append(weight_tensors[idx])
-                idx += 1
+        for layer in model.layers:
+            if not layer.weights:
+                continue
+
+            # Check if layer name exists in h5 file
+            target_group = None
+            if layer.name in root:
+                target_group = root[layer.name]
             else:
-                # If exact shape isn't at idx, search upcoming matches
-                match_found = False
-                for j in range(idx, len(weight_tensors)):
-                    if weight_tensors[j].shape == w.shape:
-                        new_weights.append(weight_tensors[j])
-                        weight_tensors.pop(j)
-                        match_found = True
+                # Search nested groups if wrapped in functional/sequential
+                for key in root.keys():
+                    if isinstance(root[key], h5py.Group) and layer.name in root[key]:
+                        target_group = root[key][layer.name]
                         break
-                if not match_found:
-                    new_weights.append(w)
-        layer.set_weights(new_weights)
+
+            if target_group is not None:
+                # Keras 3 stores variables under 'vars' group
+                var_group = target_group["vars"] if "vars" in target_group else target_group
+                weight_arrays = [np.array(var_group[k]) for k in sorted(var_group.keys(), key=lambda x: int(x) if x.isdigit() else x)]
+                
+                # Assign if counts match
+                if len(weight_arrays) == len(layer.get_weights()):
+                    try:
+                        layer.set_weights(weight_arrays)
+                    except Exception:
+                        pass
 
 @st.cache_resource
 def load_all():
@@ -65,7 +65,7 @@ def load_all():
         repo_type="space"
     )
 
-    # 3. Extract weights
+    # 3. Extract model.weights.h5
     tmp_dir = tempfile.mkdtemp()
     weights_path = os.path.join(tmp_dir, "model.weights.h5")
     with zipfile.ZipFile(model_path, "r") as archive:
@@ -77,14 +77,14 @@ def load_all():
         include_top=False,
         input_shape=(224, 224, 3)
     )
-    x = tf.keras.layers.GlobalAveragePooling2D()(base.output)
-    x = tf.keras.layers.Dense(256, activation="relu")(x)
-    x = tf.keras.layers.Dropout(0.3)(x)
-    outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+    x = tf.keras.layers.GlobalAveragePooling2D(name="global_average_pooling2d")(base.output)
+    x = tf.keras.layers.Dense(256, activation="relu", name="dense")(x)
+    x = tf.keras.layers.Dropout(0.3, name="dropout")(x)
+    outputs = tf.keras.layers.Dense(num_classes, activation="softmax", name="dense_1")(x)
     model = tf.keras.models.Model(inputs=base.input, outputs=outputs)
 
-    # 5. Populate model weights
-    load_weights_by_shape(model, weights_path)
+    # 5. Populate weights safely
+    load_exact_weights(model, weights_path)
 
     return model, idx_to_class
 
@@ -96,7 +96,7 @@ if uploaded_file:
     image_raw = Image.open(uploaded_file).convert("RGB")
     st.image(image_raw, caption="Uploaded Image", use_container_width=True)
 
-    # Preprocessing with DenseNet normalization
+    # Preprocess
     resized = image_raw.resize((224, 224))
     img_array = np.array(resized, dtype=np.float32)
     img_array = np.expand_dims(img_array, axis=0)
@@ -104,11 +104,17 @@ if uploaded_file:
 
     # Forward pass
     preds = model(img_array, training=False).numpy()[0]
+    
+    # Handle numerical stability
+    if np.isnan(preds).any():
+        preds = np.nan_to_num(preds)
+    
     top_idx = int(np.argmax(preds))
+    confidence = float(preds[top_idx])
 
-    st.subheader(f"Prediction: **{idx_to_class[top_idx]}** ({preds[top_idx]*100:.1f}%)")
+    st.subheader(f"Prediction: **{idx_to_class[top_idx]}** ({confidence * 100:.1f}%)")
 
-    # Grad-CAM
+    # Grad-CAM Visualization
     try:
         last_conv = model.get_layer("relu")
         grad_model = tf.keras.models.Model(
@@ -131,4 +137,4 @@ if uploaded_file:
 
         st.image(overlay, caption="Grad-CAM Attention Map", use_container_width=True)
     except Exception as e:
-        st.caption(f"Grad-CAM visualizer unavailable for this sample: {e}")
+        st.caption(f"Grad-CAM visualizer unavailable: {e}")
