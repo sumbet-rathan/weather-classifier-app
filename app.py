@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 import tensorflow as tf
-import keras  # Native Keras 3 for deserializing .keras files
 from huggingface_hub import hf_hub_download
 
 st.set_page_config(page_title="Weather Classifier", layout="centered")
@@ -17,8 +16,8 @@ def load_all():
         filename="best_weather_model.keras",
         repo_type="space"
     )
-    # Native Keras 3 loader
-    model = keras.models.load_model(model_path)
+    # TensorFlow 2.16 uses Keras 3 under the hood
+    model = tf.keras.models.load_model(model_path)
     
     with open("weather_classes.json", "r") as f:
         labels = json.load(f)
