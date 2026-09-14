@@ -1,7 +1,6 @@
-streamlit
-keras>=3.3.0
-tensorflow-cpu>=2.16.1
-pillow
-matplotlib
+streamlit>=1.30.0
+tensorflow-cpu==2.15.0
+pillow>=9.5.0
+matplotlib>=3.7.0
 numpy<2.0.0
 huggingface_hub
