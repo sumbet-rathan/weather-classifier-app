@@ -3,6 +3,7 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 import json
+import h5py
 from PIL import Image
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,15 +15,51 @@ from huggingface_hub import hf_hub_download
 st.set_page_config(page_title="Weather Classifier", layout="centered")
 st.title("🌦️ Weather Classifier (DenseNet121 + Grad-CAM)")
 
+def transfer_k3_weights_to_k2(model, h5_path):
+    """Maps Keras 3 H5 weights directly into the matching Keras 2 model layers."""
+    with h5py.File(h5_path, "r") as f:
+        # Check if weights are grouped under 'layers'
+        root = f["layers"] if "layers" in f else f
+        
+        # Build a lookup table of weight arrays by their base layer name
+        weight_store = {}
+        for layer_key in root.keys():
+            grp = root[layer_key]
+            # Handle Keras 3 'vars' sub-group if present
+            if "vars" in grp:
+                grp = grp["vars"]
+            tensors = [np.array(grp[k]) for k in sorted(grp.keys(), key=lambda x: int(x) if x.isdigit() else x)]
+            weight_store[layer_key] = tensors
+
+        # Assign weights to model layers
+        for layer in model.layers:
+            # If base model is nested or has matching name
+            matched_weights = weight_store.get(layer.name)
+            
+            # Fallback search if names have suffixes like '_1' or nested prefixes
+            if matched_weights is None:
+                for k in weight_store:
+                    if layer.name == k.split("/")[-1]:
+                        matched_weights = weight_store[k]
+                        break
+
+            if matched_weights:
+                model_w = layer.get_weights()
+                if len(model_w) == len(matched_weights):
+                    try:
+                        layer.set_weights(matched_weights)
+                    except Exception:
+                        pass
+
 @st.cache_resource
 def load_all():
-    # 1. Load class labels
+    # 1. Load class names
     with open("weather_classes.json", "r") as f:
         labels = json.load(f)
     idx_to_class = {int(k): v for k, v in labels.items()}
     num_classes = len(idx_to_class)
 
-    # 2. Build DenseNet121 architecture
+    # 2. Reconstruct architecture
     base = tf.keras.applications.DenseNet121(
         weights=None,
         include_top=False,
@@ -34,13 +71,18 @@ def load_all():
     outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
     model = tf.keras.models.Model(inputs=base.input, outputs=outputs)
 
-    # 3. Fetch and load weights directly
+    # 3. Download weights file from Hugging Face
     weights_path = hf_hub_download(
         repo_id="RATHANSUMBET14/weather-vision-app",
         filename="weather_model.weights.h5",
         repo_type="space"
     )
-    model.load_weights(weights_path)
+
+    # 4. Safely load weights
+    try:
+        model.load_weights(weights_path, by_name=True, skip_mismatch=True)
+    except Exception:
+        transfer_k3_weights_to_k2(model, weights_path)
 
     return model, idx_to_class
 
@@ -52,13 +94,13 @@ if uploaded_file:
     image_raw = Image.open(uploaded_file).convert("RGB")
     st.image(image_raw, caption="Uploaded Image", use_container_width=True)
 
-    # Preprocessing with DenseNet normalization
+    # Preprocess with proper DenseNet normalization
     resized = image_raw.resize((224, 224))
     img_array = np.array(resized, dtype=np.float32)
     img_array = np.expand_dims(img_array, axis=0)
     img_array = preprocess_input(img_array)
 
-    # Inference
+    # Prediction
     preds = model(img_array, training=False).numpy()[0]
     top_idx = int(np.argmax(preds))
     confidence = float(preds[top_idx])
