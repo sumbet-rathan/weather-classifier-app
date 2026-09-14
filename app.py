@@ -5,6 +5,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 import json
 import zipfile
 import tempfile
+import h5py
 from PIL import Image
 import matplotlib.pyplot as plt
 import numpy as np
@@ -16,12 +17,46 @@ from huggingface_hub import hf_hub_download
 st.set_page_config(page_title="Weather Classifier", layout="centered")
 st.title("🌦️ Weather Classifier (DenseNet121 + Grad-CAM)")
 
+def load_weights_by_shape(model, h5_file_path):
+    """Walks the h5 weights file and sets weights matching layer shapes."""
+    with h5py.File(h5_file_path, "r") as f:
+        weight_tensors = []
+        def visitor(name, obj):
+            if isinstance(obj, h5py.Dataset):
+                weight_tensors.append(np.array(obj))
+        f.visititems(visitor)
+
+    # Assign weights sequentially to layers that expect them
+    idx = 0
+    for layer in model.layers:
+        weights = layer.get_weights()
+        if not weights:
+            continue
+        new_weights = []
+        for w in weights:
+            if idx < len(weight_tensors) and weight_tensors[idx].shape == w.shape:
+                new_weights.append(weight_tensors[idx])
+                idx += 1
+            else:
+                # If exact shape isn't at idx, search upcoming matches
+                match_found = False
+                for j in range(idx, len(weight_tensors)):
+                    if weight_tensors[j].shape == w.shape:
+                        new_weights.append(weight_tensors[j])
+                        weight_tensors.pop(j)
+                        match_found = True
+                        break
+                if not match_found:
+                    new_weights.append(w)
+        layer.set_weights(new_weights)
+
 @st.cache_resource
 def load_all():
-    # 1. Load classes
+    # 1. Load labels
     with open("weather_classes.json", "r") as f:
         labels = json.load(f)
     idx_to_class = {int(k): v for k, v in labels.items()}
+    num_classes = len(idx_to_class)
 
     # 2. Download model archive
     model_path = hf_hub_download(
@@ -30,24 +65,26 @@ def load_all():
         repo_type="space"
     )
 
-    # 3. Unpack .keras archive and patch Keras 3 config for Keras 2
+    # 3. Extract weights
     tmp_dir = tempfile.mkdtemp()
-    with zipfile.ZipFile(model_path, "r") as archive:
-        archive.extractall(tmp_dir)
-
-    config_path = os.path.join(tmp_dir, "config.json")
     weights_path = os.path.join(tmp_dir, "model.weights.h5")
+    with zipfile.ZipFile(model_path, "r") as archive:
+        archive.extract("model.weights.h5", path=tmp_dir)
 
-    with open(config_path, "r") as f:
-        config_str = f.read()
+    # 4. Reconstruct DenseNet121 architecture
+    base = tf.keras.applications.DenseNet121(
+        weights=None,
+        include_top=False,
+        input_shape=(224, 224, 3)
+    )
+    x = tf.keras.layers.GlobalAveragePooling2D()(base.output)
+    x = tf.keras.layers.Dense(256, activation="relu")(x)
+    x = tf.keras.layers.Dropout(0.3)(x)
+    outputs = tf.keras.layers.Dense(num_classes, activation="softmax")(x)
+    model = tf.keras.models.Model(inputs=base.input, outputs=outputs)
 
-    # Convert Keras 3 "batch_shape" -> Keras 2 "batch_input_shape"
-    config_str = config_str.replace('"batch_shape"', '"batch_input_shape"')
-    model_config = json.loads(config_str)
-
-    # Reconstruct the EXACT trained model graph
-    model = tf.keras.models.model_from_json(json.dumps(model_config))
-    model.load_weights(weights_path)
+    # 5. Populate model weights
+    load_weights_by_shape(model, weights_path)
 
     return model, idx_to_class
 
@@ -71,31 +108,16 @@ if uploaded_file:
 
     st.subheader(f"Prediction: **{idx_to_class[top_idx]}** ({preds[top_idx]*100:.1f}%)")
 
-    # Grad-CAM Visualization
+    # Grad-CAM
     try:
-        # Find the last convolutional/relu layer automatically
-        target_layer = None
-        for layer in reversed(model.layers):
-            if hasattr(layer, "layers"):  # Nested functional backbone
-                for sub_layer in reversed(layer.layers):
-                    if "relu" in sub_layer.name or "conv" in sub_layer.name:
-                        target_layer = sub_layer
-                        break
-            elif "relu" in layer.name or "conv" in layer.name:
-                target_layer = layer
-                break
-            if target_layer:
-                break
-
+        last_conv = model.get_layer("relu")
         grad_model = tf.keras.models.Model(
             inputs=model.input,
-            outputs=[target_layer.output, model.output]
+            outputs=[last_conv.output, model.output]
         )
-
         with tf.GradientTape() as tape:
             conv_out, p = grad_model(img_array)
             loss = p[:, top_idx]
-
         grads = tape.gradient(loss, conv_out)
         pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
         heatmap = conv_out[0] @ pooled_grads[..., tf.newaxis]
