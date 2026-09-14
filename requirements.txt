@@ -1,7 +1,7 @@
 streamlit
 tensorflow-cpu==2.15.0
+h5py
 pillow
 matplotlib
 numpy<2.0.0
 huggingface_hub
-h5py
