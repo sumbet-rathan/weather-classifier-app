@@ -1,9 +1,14 @@
+import os
+# Force Keras 3 to use the TensorFlow backend
+os.environ["KERAS_BACKEND"] = "tensorflow"
+
 import json
 from PIL import Image
 import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
 import tensorflow as tf
+import keras
 from huggingface_hub import hf_hub_download
 
 st.set_page_config(page_title="Weather Classifier", layout="centered")
@@ -16,8 +21,8 @@ def load_all():
         filename="best_weather_model.keras",
         repo_type="space"
     )
-    # TensorFlow 2.16 uses Keras 3 under the hood
-    model = tf.keras.models.load_model(model_path)
+    # Use native Keras 3 to deserialize the .keras archive
+    model = keras.models.load_model(model_path, compile=False)
     
     with open("weather_classes.json", "r") as f:
         labels = json.load(f)
@@ -36,29 +41,32 @@ if uploaded_file:
     img_array = np.expand_dims(np.array(resized) / 255.0, axis=0)
 
     # Inference
-    preds = model.predict(img_array, verbose=0)[0]
+    preds = model(img_array, training=False).numpy()[0]
     top_idx = np.argmax(preds)
 
     st.subheader(f"Prediction: **{idx_to_class[top_idx]}** ({preds[top_idx]*100:.1f}%)")
 
     # Grad-CAM
-    backbone = model.layers[0]
-    grad_model = tf.keras.models.Model(
-        inputs=backbone.input,
-        outputs=[backbone.get_layer("relu").output, model.output]
-    )
-    with tf.GradientTape() as tape:
-        conv_out, p = grad_model(img_array)
-        loss = p[:, top_idx]
-    grads = tape.gradient(loss, conv_out)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    heatmap = conv_out[0] @ pooled_grads[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
-    heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-10)
+    try:
+        backbone = model.layers[0]
+        grad_model = tf.keras.models.Model(
+            inputs=backbone.input,
+            outputs=[backbone.get_layer("relu").output, model.output]
+        )
+        with tf.GradientTape() as tape:
+            conv_out, p = grad_model(img_array)
+            loss = p[:, top_idx]
+        grads = tape.gradient(loss, conv_out)
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+        heatmap = conv_out[0] @ pooled_grads[..., tf.newaxis]
+        heatmap = tf.squeeze(heatmap)
+        heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-10)
 
-    heatmap = np.uint8(255 * heatmap.numpy())
-    jet = plt.get_cmap("jet")(np.arange(256))[:, :3]
-    jet_heatmap = Image.fromarray(np.uint8(jet[heatmap] * 255)).resize(image_raw.size)
-    overlay = Image.blend(image_raw, jet_heatmap, alpha=0.4)
+        heatmap = np.uint8(255 * heatmap.numpy())
+        jet = plt.get_cmap("jet")(np.arange(256))[:, :3]
+        jet_heatmap = Image.fromarray(np.uint8(jet[heatmap] * 255)).resize(image_raw.size)
+        overlay = Image.blend(image_raw, jet_heatmap, alpha=0.4)
 
-    st.image(overlay, caption="Grad-CAM Attention Map", use_container_width=True)
+        st.image(overlay, caption="Grad-CAM Attention Map", use_container_width=True)
+    except Exception as e:
+        st.warning(f"Grad-CAM could not be computed: {e}")
