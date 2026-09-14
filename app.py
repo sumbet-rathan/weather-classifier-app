@@ -1,90 +1,34 @@
 import os
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
-os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+# Set Keras backend to Torch CPU before importing keras
+os.environ["KERAS_BACKEND"] = "torch"
 
 import json
-import zipfile
-import tempfile
-import h5py
 from PIL import Image
 import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
-import tensorflow as tf
-from tensorflow.keras.applications.densenet import preprocess_input
+import keras
+import torch
 from huggingface_hub import hf_hub_download
 
 st.set_page_config(page_title="Weather Classifier", layout="centered")
 st.title("🌦️ Weather Classifier (DenseNet121 + Grad-CAM)")
 
-def load_exact_weights(model, h5_path):
-    """Loads weights by matching exact layer names from Keras 3 h5 format."""
-    with h5py.File(h5_path, "r") as h5:
-        # Check top-level group structure
-        root = h5["layers"] if "layers" in h5 else h5
-
-        for layer in model.layers:
-            if not layer.weights:
-                continue
-
-            # Check if layer name exists in h5 file
-            target_group = None
-            if layer.name in root:
-                target_group = root[layer.name]
-            else:
-                # Search nested groups if wrapped in functional/sequential
-                for key in root.keys():
-                    if isinstance(root[key], h5py.Group) and layer.name in root[key]:
-                        target_group = root[key][layer.name]
-                        break
-
-            if target_group is not None:
-                # Keras 3 stores variables under 'vars' group
-                var_group = target_group["vars"] if "vars" in target_group else target_group
-                weight_arrays = [np.array(var_group[k]) for k in sorted(var_group.keys(), key=lambda x: int(x) if x.isdigit() else x)]
-                
-                # Assign if counts match
-                if len(weight_arrays) == len(layer.get_weights()):
-                    try:
-                        layer.set_weights(weight_arrays)
-                    except Exception:
-                        pass
-
 @st.cache_resource
 def load_all():
-    # 1. Load labels
-    with open("weather_classes.json", "r") as f:
-        labels = json.load(f)
-    idx_to_class = {int(k): v for k, v in labels.items()}
-    num_classes = len(idx_to_class)
-
-    # 2. Download model archive
+    # 1. Download trained Keras 3 model directly
     model_path = hf_hub_download(
         repo_id="RATHANSUMBET14/weather-vision-app",
         filename="best_weather_model.keras",
         repo_type="space"
     )
+    # Native Keras 3 direct load (no compile needed for inference)
+    model = keras.models.load_model(model_path, compile=False)
 
-    # 3. Extract model.weights.h5
-    tmp_dir = tempfile.mkdtemp()
-    weights_path = os.path.join(tmp_dir, "model.weights.h5")
-    with zipfile.ZipFile(model_path, "r") as archive:
-        archive.extract("model.weights.h5", path=tmp_dir)
-
-    # 4. Reconstruct DenseNet121 architecture
-    base = tf.keras.applications.DenseNet121(
-        weights=None,
-        include_top=False,
-        input_shape=(224, 224, 3)
-    )
-    x = tf.keras.layers.GlobalAveragePooling2D(name="global_average_pooling2d")(base.output)
-    x = tf.keras.layers.Dense(256, activation="relu", name="dense")(x)
-    x = tf.keras.layers.Dropout(0.3, name="dropout")(x)
-    outputs = tf.keras.layers.Dense(num_classes, activation="softmax", name="dense_1")(x)
-    model = tf.keras.models.Model(inputs=base.input, outputs=outputs)
-
-    # 5. Populate weights safely
-    load_exact_weights(model, weights_path)
+    # 2. Load class labels
+    with open("weather_classes.json", "r") as f:
+        labels = json.load(f)
+    idx_to_class = {int(k): v for k, v in labels.items()}
 
     return model, idx_to_class
 
@@ -96,19 +40,18 @@ if uploaded_file:
     image_raw = Image.open(uploaded_file).convert("RGB")
     st.image(image_raw, caption="Uploaded Image", use_container_width=True)
 
-    # Preprocess
+    # Preprocessing: DenseNet ImageNet normalization: (x / 255 - mean) / std
     resized = image_raw.resize((224, 224))
-    img_array = np.array(resized, dtype=np.float32)
-    img_array = np.expand_dims(img_array, axis=0)
-    img_array = preprocess_input(img_array)
+    img_np = np.array(resized, dtype=np.float32) / 255.0
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    img_norm = (img_np - mean) / std
+    img_tensor = np.expand_dims(img_norm, axis=0)
 
     # Forward pass
-    preds = model(img_array, training=False).numpy()[0]
-    
-    # Handle numerical stability
-    if np.isnan(preds).any():
-        preds = np.nan_to_num(preds)
-    
+    preds = model(img_tensor, training=False)
+    preds = np.array(preds)[0]
+
     top_idx = int(np.argmax(preds))
     confidence = float(preds[top_idx])
 
@@ -116,25 +59,47 @@ if uploaded_file:
 
     # Grad-CAM Visualization
     try:
-        last_conv = model.get_layer("relu")
-        grad_model = tf.keras.models.Model(
-            inputs=model.input,
-            outputs=[last_conv.output, model.output]
-        )
-        with tf.GradientTape() as tape:
-            conv_out, p = grad_model(img_array)
-            loss = p[:, top_idx]
-        grads = tape.gradient(loss, conv_out)
-        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-        heatmap = conv_out[0] @ pooled_grads[..., tf.newaxis]
-        heatmap = tf.squeeze(heatmap)
-        heatmap = tf.maximum(heatmap, 0) / (tf.math.reduce_max(heatmap) + 1e-10)
+        # Locate target convolution layer in DenseNet121
+        target_layer = None
+        for layer in reversed(model.layers):
+            if hasattr(layer, "layers"):
+                for sub in reversed(layer.layers):
+                    if "relu" in sub.name or "conv" in sub.name:
+                        target_layer = sub
+                        break
+            elif "relu" in layer.name or "conv" in layer.name:
+                target_layer = layer
+                break
+            if target_layer:
+                break
 
-        heatmap = np.uint8(255 * heatmap.numpy())
-        jet = plt.get_cmap("jet")(np.arange(256))[:, :3]
-        jet_heatmap = Image.fromarray(np.uint8(jet[heatmap] * 255)).resize(image_raw.size)
-        overlay = Image.blend(image_raw, jet_heatmap, alpha=0.4)
+        if target_layer is not None:
+            feature_extractor = keras.Model(
+                inputs=model.inputs,
+                outputs=[target_layer.output, model.output]
+            )
 
-        st.image(overlay, caption="Grad-CAM Attention Map", use_container_width=True)
+            x_torch = torch.tensor(img_tensor, requires_grad=True)
+            conv_out, out_logits = feature_extractor(x_torch)
+            loss = out_logits[0, top_idx]
+            loss.backward()
+
+            grads = x_torch.grad
+            pooled_grads = torch.mean(conv_out, dim=(0, 1, 2)).detach().numpy()
+            conv_out_np = conv_out[0].detach().numpy()
+
+            for i in range(conv_out_np.shape[-1]):
+                conv_out_np[:, :, i] *= pooled_grads[i]
+
+            heatmap = np.mean(conv_out_np, axis=-1)
+            heatmap = np.maximum(heatmap, 0)
+            heatmap /= (np.max(heatmap) + 1e-10)
+
+            heatmap = np.uint8(255 * heatmap)
+            jet = plt.get_cmap("jet")(np.arange(256))[:, :3]
+            jet_heatmap = Image.fromarray(np.uint8(jet[heatmap] * 255)).resize(image_raw.size)
+            overlay = Image.blend(image_raw, jet_heatmap, alpha=0.4)
+
+            st.image(overlay, caption="Grad-CAM Attention Map", use_container_width=True)
     except Exception as e:
-        st.caption(f"Grad-CAM visualizer unavailable: {e}")
+        st.caption(f"Grad-CAM visualizer unavailable for this sample: {e}")
